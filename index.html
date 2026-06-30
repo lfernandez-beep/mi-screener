@@ -424,11 +424,11 @@ select.inp{cursor:pointer;appearance:none;background-image:url("data:image/svg+x
         </div>
       </div>
       <div class="key-block">
-        <label>🎯 FMP API Key (target price) <a href="https://site.financialmodelingprep.com/developer/docs/dashboard" target="_blank">obtener gratis ↗</a></label>
+        <label>🎯 FMP API Key <span style="color:var(--green);font-weight:600">(opcional)</span> — fallback si la función falla <a href="https://site.financialmodelingprep.com/developer/docs/dashboard" target="_blank">obtener gratis ↗</a></label>
         <div class="key-input-row">
-          <input type="text" id="fmpKeyInput" placeholder="Para target price consensus…">
+          <input type="text" id="fmpKeyInput" placeholder="Opcional — target price vía Netlify Function ahora">
           <button class="btn-fetch" onclick="saveFmpKey()">Guardar</button>
-          <span class="key-status" id="fmpKeyStatus">⚠ Sin key</span>
+          <span class="key-status" id="fmpKeyStatus" style="color:var(--text3)">Opcional</span>
         </div>
       </div>
     </div>
@@ -2404,15 +2404,52 @@ function debugLog(msg, type='') {
 // ═══════════════════════════════════════════════════════════
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// URL de la Netlify Function — se autodetecta del dominio actual
+const NETLIFY_TARGET_FN = (() => {
+  const host = window.location.origin;
+  // Si estamos en Netlify (*.netlify.app o dominio custom), usamos la función
+  // Si estamos en localhost o abriendo el archivo directo, caemos al fallback
+  if (host.includes('netlify.app') || host.includes('netlify.com') || !host.startsWith('file://')) {
+    return `${host}/.netlify/functions/target`;
+  }
+  return null;
+})();
+
 async function fetchTarget(ticker) {
-  const fmpKey = getFmpKey();
   const enc = encodeURIComponent(ticker);
+
+  // ── ESTRATEGIA 1: Netlify Function (servidor propio, máxima cobertura) ──
+  if (NETLIFY_TARGET_FN) {
+    try {
+      const res = await fetch(`${NETLIFY_TARGET_FN}?ticker=${enc}`, {
+        signal: AbortSignal.timeout(12000)
+      });
+      if (res.ok) {
+        const d = await res.json();
+        if (d.target != null) {
+          debugLog(`  ${ticker}: target via Netlify fn ✓ ($${d.target})`, 'ok');
+          return {
+            target: d.target,
+            targetHigh: d.high,
+            targetLow: d.low,
+            targetMedian: d.median,
+            analysts: d.numAnalysts,
+            source: 'Netlify/Yahoo'
+          };
+        }
+      }
+    } catch(e) {
+      debugLog(`  ${ticker}: Netlify fn falló (${e.message}), intentando FMP…`, 'warn');
+    }
+  }
+
+  // ── ESTRATEGIA 2: FMP (si el usuario tiene key y la función falló) ──
+  const fmpKey = getFmpKey();
   if (fmpKey) {
     const endpoints = [
       `https://financialmodelingprep.com/stable/price-target-consensus?symbol=${enc}&apikey=${fmpKey}`,
       `https://financialmodelingprep.com/api/v4/price-target-consensus?symbol=${enc}&apikey=${fmpKey}`,
       `https://financialmodelingprep.com/stable/price-target-summary?symbol=${enc}&apikey=${fmpKey}`,
-      `https://financialmodelingprep.com/api/v4/price-target-summary?symbol=${enc}&apikey=${fmpKey}`,
     ];
     for (const url of endpoints) {
       try {
@@ -2422,16 +2459,25 @@ async function fetchTarget(ticker) {
         const arr = Array.isArray(data) ? data : [data];
         if (!arr.length) continue;
         const t = arr[0];
-        // Try consensus first, then summary fields
-        if (t.targetConsensus) return { target: t.targetConsensus, targetHigh: t.targetHigh, targetLow: t.targetLow, source: 'FMP cons' };
-        const sum = t.lastQuarterAvgPriceTarget || t.lastMonthAvgPriceTarget || t.lastYearAvgPriceTarget || t.allTimeAvgPriceTarget;
-        if (sum && sum > 0) return { target: sum, source: 'FMP sum' };
+        if (t.targetConsensus) {
+          debugLog(`  ${ticker}: target via FMP ✓`, 'ok');
+          return { target: t.targetConsensus, targetHigh: t.targetHigh, targetLow: t.targetLow, source: 'FMP' };
+        }
+        const sum = t.lastQuarterAvgPriceTarget || t.lastMonthAvgPriceTarget || t.lastYearAvgPriceTarget;
+        if (sum && sum > 0) {
+          debugLog(`  ${ticker}: target via FMP summary ✓`, 'ok');
+          return { target: sum, source: 'FMP summary' };
+        }
       } catch(e) {}
     }
   }
-  // Yahoo fallback
+
+  // ── ESTRATEGIA 3: Yahoo via proxy CORS (último recurso) ──
   const yu = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${enc}?modules=financialData&formatted=false`;
-  for (const px of [`https://corsproxy.io/?${encodeURIComponent(yu)}`, `https://api.allorigins.win/raw?url=${encodeURIComponent(yu)}`]) {
+  for (const px of [
+    `https://corsproxy.io/?${encodeURIComponent(yu)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(yu)}`
+  ]) {
     try {
       const r = await fetch(px, { signal: AbortSignal.timeout(6000) });
       if (!r.ok) continue;
@@ -2439,9 +2485,14 @@ async function fetchTarget(ticker) {
       const fd = j?.quoteSummary?.result?.[0]?.financialData;
       if (!fd) continue;
       const tg = typeof fd.targetMeanPrice === 'object' ? fd.targetMeanPrice?.raw : fd.targetMeanPrice;
-      if (tg != null) return { target: tg, source: 'Yahoo' };
+      if (tg != null) {
+        debugLog(`  ${ticker}: target via proxy Yahoo ✓`, 'ok');
+        return { target: tg, source: 'Yahoo proxy' };
+      }
     } catch(e) {}
   }
+
+  debugLog(`  ${ticker}: sin target en ninguna fuente`, 'warn');
   return null;
 }
 
